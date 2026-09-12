@@ -1,8 +1,8 @@
 # Quantus CLI v2.2.2 — Local Fork Security Audit
 
-**Baseline:** `Quantus-Network/quantus-cli` v2.2.2  
-**Reviewed commit:** `b98083bf29a3bee5a121affd723431d3654c3247`  
-**Audit type:** focused static review and conservative hardening pass  
+**Baseline:** `Quantus-Network/quantus-cli` v2.2.2
+**Reviewed commit:** `b98083bf29a3bee5a121affd723431d3654c3247`
+**Audit type:** focused static review and conservative hardening pass
 **Not a formal cryptographic proof or third-party penetration test.**
 
 ## Executive assessment
