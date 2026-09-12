@@ -412,11 +412,14 @@ pub async fn collect_doctor_report(node_url: &str, offline: bool) -> DoctorRepor
     let endpoint = inspect_endpoint(&mut report, node_url);
     inspect_runtime(&mut report, node_url, endpoint, offline).await;
 
-    report.push(
-        "Updater authenticity",
-        DoctorStatus::Warn,
-        "Release updater verifies SHA-256 checksums, but independent publisher-signature verification is not implemented in this hardened line.",
-    );
+    match crate::cli::update::release_trust_summary() {
+        Ok(detail) => report.push("Updater authenticity", DoctorStatus::Pass, detail),
+        Err(e) => report.push(
+            "Updater authenticity",
+            DoctorStatus::Warn,
+            format!("Signed updater trust is not fully configured: {e}"),
+        ),
+    }
 
     report.push(
         "Dependency audit",

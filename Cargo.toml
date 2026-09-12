@@ -61,6 +61,8 @@ dirs = "6.0"
 hex = "0.4"
 rpassword = "7.4"
 sha2 = "0.10"
+# Trust-critical release verifier: exact pin; zero transitive dependencies.
+minisign-verify = "=0.2.5"
 
 # Quantum-Safe Encryption
 aes-gcm = "0.10" # AES-256-GCM (quantum-safe with 256-bit keys)

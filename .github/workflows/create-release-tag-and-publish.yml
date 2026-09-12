@@ -280,6 +280,7 @@ jobs:
     needs: [create-tag, build-and-test, security-audit, build-release-binaries]
     if: always() && needs.build-and-test.result == 'success' && needs.security-audit.result == 'success' && needs.build-release-binaries.result == 'success'
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     steps:
@@ -296,6 +297,87 @@ jobs:
           pattern: release-assets-*
           merge-multiple: true
 
+
+      - name: Install Minisign
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+
+      - name: Prepare protected release signing key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not configured in the protected release environment"
+            exit 1
+          fi
+          SIGNING_KEY="$RUNNER_TEMP/quantus-release.key"
+          GENERATED_PUBLIC="$RUNNER_TEMP/quantus-release.generated.pub"
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$SIGNING_KEY"
+          chmod 600 "$SIGNING_KEY"
+          minisign -R -s "$SIGNING_KEY" -p "$GENERATED_PUBLIC"
+
+          configured_key=$(awk 'NF && $0 !~ /^untrusted comment:/ {print; exit}' release-signing-public-key.pub)
+          generated_key=$(awk 'NF && $0 !~ /^untrusted comment:/ {print; exit}' "$GENERATED_PUBLIC")
+          if [ -z "$configured_key" ] || [ "$configured_key" = "UNCONFIGURED" ]; then
+            echo "::error::release-signing-public-key.pub is not configured"
+            exit 1
+          fi
+          if [ "$configured_key" != "$generated_key" ]; then
+            echo "::error::CI signing secret does not match the public key pinned in source"
+            exit 1
+          fi
+          echo "SIGNING_KEY=$SIGNING_KEY" >> "$GITHUB_ENV"
+
+      - name: Generate and sign release provenance manifest
+        env:
+          NEW_VERSION: ${{ needs.create-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          export SOURCE_COMMIT
+          python3 - <<'PY'
+          import glob, hashlib, json, os
+          artifacts = []
+          paths = sorted(glob.glob("downloaded-artifacts/*.zip") + glob.glob("downloaded-artifacts/*.tar.gz"))
+          if not paths:
+              raise SystemExit("no release archives found for signed manifest")
+          for path in paths:
+              h = hashlib.sha256()
+              size = 0
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      size += len(chunk)
+                      h.update(chunk)
+              artifacts.append({"name": os.path.basename(path), "sha256": h.hexdigest(), "size": size})
+          manifest = {
+              "schema": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "version": os.environ["NEW_VERSION"],
+              "commit": os.environ["SOURCE_COMMIT"],
+              "artifacts": artifacts,
+          }
+          with open("downloaded-artifacts/release-manifest.json", "w", encoding="utf-8", newline="\n") as f:
+              json.dump(manifest, f, sort_keys=True, separators=(",", ":"))
+              f.write("\n")
+          PY
+
+          minisign -S -W \
+            -s "$SIGNING_KEY" \
+            -m downloaded-artifacts/release-manifest.json \
+            -x downloaded-artifacts/release-manifest.json.minisig \
+            -t "quantus-cli ${NEW_VERSION} ${SOURCE_COMMIT}"
+
+          minisign -V \
+            -p release-signing-public-key.pub \
+            -m downloaded-artifacts/release-manifest.json \
+            -x downloaded-artifacts/release-manifest.json.minisig
+
+          rm -f "$SIGNING_KEY"
+
       - name: Create GitHub Release with assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -308,7 +390,7 @@ jobs:
           echo "--- Release assets ---"
           ls -la downloaded-artifacts
 
-          mapfile -t asset_args < <(find downloaded-artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.txt" \))
+          mapfile -t asset_args < <(find downloaded-artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.txt" -o -name "*.json" -o -name "*.minisig" \))
           if [ "${#asset_args[@]}" -eq 0 ]; then
             echo "::error::No release assets found to attach"
             exit 1

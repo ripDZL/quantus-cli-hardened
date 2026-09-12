@@ -26,9 +26,210 @@ use std::{
 	path::Path,
 };
 
-const REPO_OWNER: &str = "Quantus-Network";
-const REPO_NAME: &str = "quantus-cli";
 const BIN_NAME: &str = "quantus";
+
+const RELEASE_MANIFEST_NAME: &str = "release-manifest.json";
+const RELEASE_MANIFEST_SIGNATURE_NAME: &str = "release-manifest.json.minisig";
+const RELEASE_PUBLIC_KEY_TEXT: &str = include_str!("../../release-signing-public-key.pub");
+const UPDATE_REPOSITORY_TEXT: &str = include_str!("../../release-update-repository.txt");
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedReleaseManifest {
+	schema: u32,
+	repository: String,
+	version: String,
+	commit: String,
+	artifacts: Vec<SignedReleaseArtifact>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedReleaseArtifact {
+	name: String,
+	sha256: String,
+	size: u64,
+}
+
+fn valid_repository_component(value: &str) -> bool {
+	!value.is_empty()
+		&& value.len() <= 100
+		&& value
+			.bytes()
+			.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn update_repository() -> crate::error::Result<(String, String)> {
+	let raw = UPDATE_REPOSITORY_TEXT.trim();
+	let mut parts = raw.split('/');
+	let owner = parts.next().unwrap_or_default();
+	let repo = parts.next().unwrap_or_default();
+
+	if parts.next().is_some()
+		|| !valid_repository_component(owner)
+		|| !valid_repository_component(repo)
+	{
+		return Err(QuantusError::Generic(format!(
+			"Invalid pinned update repository `{raw}` in release-update-repository.txt"
+		)));
+	}
+
+	Ok((owner.to_string(), repo.to_string()))
+}
+
+fn minisign_public_key_line_from_text(text: &str) -> crate::error::Result<&str> {
+	let key = text
+		.lines()
+		.map(str::trim)
+		.find(|line| !line.is_empty() && !line.starts_with("untrusted comment:"))
+		.ok_or_else(|| QuantusError::Generic("Release signing public key is missing".to_string()))?;
+
+	if key.eq_ignore_ascii_case("UNCONFIGURED") {
+		return Err(QuantusError::Generic(
+			"Release signing public key is not configured. Run tools/configure-signed-updates.ps1 before enabling self-update."
+				.to_string(),
+		));
+	}
+
+	if !key.starts_with("RW") || key.len() < 50 || key.len() > 80 {
+		return Err(QuantusError::Generic(
+			"Embedded Minisign release public key has an invalid format".to_string(),
+		));
+	}
+
+	Ok(key)
+}
+
+fn release_public_key() -> crate::error::Result<minisign_verify::PublicKey> {
+	let key_line = minisign_public_key_line_from_text(RELEASE_PUBLIC_KEY_TEXT)?;
+	minisign_verify::PublicKey::from_base64(key_line).map_err(|e| {
+		QuantusError::Generic(format!("Embedded Minisign release public key is invalid: {e}"))
+	})
+}
+
+fn verify_minisign_with_key(
+	public_key_line: &str,
+	data: &[u8],
+	signature_text: &str,
+) -> crate::error::Result<()> {
+	let public_key = minisign_verify::PublicKey::from_base64(public_key_line)
+		.map_err(|e| QuantusError::Generic(format!("Invalid Minisign public key: {e}")))?;
+	let signature = minisign_verify::Signature::decode(signature_text)
+		.map_err(|e| QuantusError::Generic(format!("Invalid Minisign signature format: {e}")))?;
+
+	public_key.verify(data, &signature, false).map_err(|e| {
+		QuantusError::Generic(format!(
+			"Release manifest signature verification failed: {e}. Refusing to install."
+		))
+	})
+}
+
+fn verify_release_manifest_signature(
+	manifest_bytes: &[u8],
+	signature_text: &str,
+) -> crate::error::Result<()> {
+	let key_line = minisign_public_key_line_from_text(RELEASE_PUBLIC_KEY_TEXT)?;
+	verify_minisign_with_key(key_line, manifest_bytes, signature_text)
+}
+
+fn normalize_release_version(version: &str) -> &str {
+	version.trim().trim_start_matches('v')
+}
+
+fn validate_signed_release_manifest(
+	manifest_bytes: &[u8],
+	release_version: &str,
+	archive_name: &str,
+) -> crate::error::Result<SignedReleaseArtifact> {
+	let manifest: SignedReleaseManifest = serde_json::from_slice(manifest_bytes)
+		.map_err(|e| QuantusError::Generic(format!("Signed release manifest is invalid JSON: {e}")))?;
+
+	if manifest.schema != 1 {
+		return Err(QuantusError::Generic(format!(
+			"Unsupported signed release manifest schema {}",
+			manifest.schema
+		)));
+	}
+
+	let (owner, repo) = update_repository()?;
+	let expected_repository = format!("{owner}/{repo}");
+	if manifest.repository != expected_repository {
+		return Err(QuantusError::Generic(format!(
+			"Signed release manifest repository mismatch: expected `{expected_repository}`, got `{}`",
+			manifest.repository
+		)));
+	}
+
+	if normalize_release_version(&manifest.version) != normalize_release_version(release_version) {
+		return Err(QuantusError::Generic(format!(
+			"Signed release manifest version mismatch: release `{release_version}`, manifest `{}`",
+			manifest.version
+		)));
+	}
+
+	if manifest.commit.len() != 40 || !manifest.commit.chars().all(|c| c.is_ascii_hexdigit()) {
+		return Err(QuantusError::Generic(
+			"Signed release manifest contains an invalid source commit SHA".to_string(),
+		));
+	}
+
+	if manifest.artifacts.is_empty() || manifest.artifacts.len() > 32 {
+		return Err(QuantusError::Generic(
+			"Signed release manifest has an invalid artifact count".to_string(),
+		));
+	}
+
+	let mut names = std::collections::HashSet::new();
+	for artifact in &manifest.artifacts {
+		if !names.insert(artifact.name.as_str()) {
+			return Err(QuantusError::Generic(format!(
+				"Signed release manifest contains duplicate artifact `{}`",
+				artifact.name
+			)));
+		}
+	}
+
+	let artifact = manifest
+		.artifacts
+		.into_iter()
+		.find(|artifact| artifact.name == archive_name)
+		.ok_or_else(|| {
+			QuantusError::Generic(format!(
+				"Signed release manifest does not authorize archive `{archive_name}`"
+			))
+		})?;
+
+	if artifact.sha256.len() != 64 || !artifact.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+		return Err(QuantusError::Generic(format!(
+			"Signed release manifest has a malformed SHA-256 for `{archive_name}`"
+		)));
+	}
+
+	if artifact.size == 0 || artifact.size > MAX_ARCHIVE_ASSET_BYTES {
+		return Err(QuantusError::Generic(format!(
+			"Signed release manifest has an invalid size {} for `{archive_name}`",
+			artifact.size
+		)));
+	}
+
+	Ok(SignedReleaseArtifact {
+		sha256: artifact.sha256.to_ascii_lowercase(),
+		..artifact
+	})
+}
+
+pub fn release_trust_summary() -> crate::error::Result<String> {
+	let (owner, repo) = update_repository()?;
+	let key_line = minisign_public_key_line_from_text(RELEASE_PUBLIC_KEY_TEXT)?;
+	let _ = release_public_key()?;
+	let fingerprint = hex::encode(Sha256::digest(key_line.as_bytes()));
+
+	Ok(format!(
+		"Signed release manifests are required for {owner}/{repo}; pinned key fingerprint sha256:{}",
+		&fingerprint[..16]
+	))
+}
+
 
 /// Identifier used to disambiguate the archive asset from the sibling
 /// `sha256sums-*.txt` asset (both contain the target triple in their name).
@@ -99,11 +300,12 @@ enum UpdateOutcome {
 /// install flow and [`latest_stable_version`] derive from it, so the version a
 /// check advertises can never disagree with the version an install resolves
 /// (they both follow GitHub's `/releases/latest` semantics).
-fn configure_updater() -> self_update::backends::github::UpdateBuilder {
+fn configure_updater() -> crate::error::Result<self_update::backends::github::UpdateBuilder> {
+	let (owner, repo) = update_repository()?;
 	let mut builder = self_update::backends::github::Update::configure();
 	builder
-		.repo_owner(REPO_OWNER)
-		.repo_name(REPO_NAME)
+		.repo_owner(&owner)
+		.repo_name(&repo)
 		.bin_name(BIN_NAME)
 		// Archives extract to `quantus-cli-v{version}-{target}/quantus`.
 		// `{{ version }}` is substituted without the leading `v`, so it is
@@ -111,7 +313,7 @@ fn configure_updater() -> self_update::backends::github::UpdateBuilder {
 		.bin_path_in_archive("quantus-cli-v{{ version }}-{{ target }}/{{ bin }}")
 		.asset_identifier(ASSET_IDENTIFIER)
 		.current_version(env!("CARGO_PKG_VERSION"));
-	builder
+	Ok(builder)
 }
 
 /// Resolve the latest *stable* release version from GitHub (without a leading
@@ -120,7 +322,7 @@ fn configure_updater() -> self_update::backends::github::UpdateBuilder {
 /// Blocking: `self_update` performs synchronous I/O, so call this off the async
 /// runtime's worker threads (e.g. via `spawn_blocking`).
 pub fn latest_stable_version() -> crate::error::Result<String> {
-	let releases = configure_updater()
+	let releases = configure_updater()?
 		.build()
 		.map_err(map_self_update_err)?
 		.get_latest_release()
@@ -220,7 +422,7 @@ fn run_update(
 		return Ok(UpdateOutcome::AlreadyLatest(current.to_string()));
 	}
 
-	let mut builder = configure_updater();
+	let mut builder = configure_updater()?;
 	builder.show_download_progress(true).no_confirm(yes);
 
 	let target_tag = version.map(|v| if v.starts_with('v') { v } else { format!("v{v}") });
@@ -246,13 +448,15 @@ fn run_update(
 	Ok(UpdateOutcome::Updated(release.version().to_string()))
 }
 
-/// Download the release archive and its published sha256sums, verify integrity,
-/// then extract and replace the running binary.
+/// Authenticate the publisher-signed release manifest, require the legacy
+/// checksum to agree with its signed hash, then verify and install the archive.
 fn install_verified_release(
 	updater: &impl self_update::update::ReleaseUpdate,
 	release: &self_update::update::Release,
 	yes: bool,
 ) -> crate::error::Result<()> {
+	let _ = release_public_key()?;
+
 	let target = updater.target();
 	let archive_asset = release.asset_for(target, Some(ASSET_IDENTIFIER)).ok_or_else(|| {
 		QuantusError::Generic(format!(
@@ -270,15 +474,58 @@ fn install_verified_release(
 				release.version()
 			))
 		})?;
+	let manifest_asset = release
+		.assets()
+		.iter()
+		.find(|a| a.name() == RELEASE_MANIFEST_NAME)
+		.cloned()
+		.ok_or_else(|| {
+			QuantusError::Generic(format!(
+				"Release v{} has no signed provenance manifest `{RELEASE_MANIFEST_NAME}`. Refusing to install.",
+				release.version()
+			))
+		})?;
+	let signature_asset = release
+		.assets()
+		.iter()
+		.find(|a| a.name() == RELEASE_MANIFEST_SIGNATURE_NAME)
+		.cloned()
+		.ok_or_else(|| {
+			QuantusError::Generic(format!(
+				"Release v{} has no manifest signature `{RELEASE_MANIFEST_SIGNATURE_NAME}`. Refusing to install.",
+				release.version()
+			))
+		})?;
+
+	log_print!("Downloading signed release provenance...");
+	let mut manifest_bytes = Vec::new();
+	download_asset(
+		manifest_asset.download_url(),
+		&mut manifest_bytes,
+		MAX_MANIFEST_ASSET_BYTES,
+		false,
+	)?;
+	let mut signature_bytes = Vec::new();
+	download_asset(
+		signature_asset.download_url(),
+		&mut signature_bytes,
+		MAX_SIGNATURE_ASSET_BYTES,
+		false,
+	)?;
+	let signature_text = std::str::from_utf8(&signature_bytes).map_err(|e| {
+		QuantusError::Generic(format!("Release manifest signature is not valid UTF-8: {e}"))
+	})?;
+
+	verify_release_manifest_signature(&manifest_bytes, signature_text)?;
+	let signed_artifact =
+		validate_signed_release_manifest(&manifest_bytes, release.version(), archive_asset.name())?;
 
 	log_print!("");
 	log_print!("{} release status:", BIN_NAME);
 	log_print!("  * Current exe: {:?}", updater.bin_install_path());
 	log_print!("  * New exe release: {}", archive_asset.name());
 	log_print!("  * Checksum file: {}", sums_asset.name());
-	log_print!(
-		"\nThe new release will be downloaded, SHA-256 verified, extracted, and the existing binary will be replaced."
-	);
+	log_print!("  * Signed manifest: {} (signature verified)", manifest_asset.name());
 
 	if !yes {
 		confirm_update()?;
@@ -290,7 +537,13 @@ fn install_verified_release(
 	let sums_text = std::str::from_utf8(&sums_bytes).map_err(|e| {
 		QuantusError::Generic(format!("Release sha256sums file is not valid UTF-8: {e}"))
 	})?;
-	let expected_hex = expected_hash_from_sha256sums(sums_text, archive_asset.name())?;
+	let checksum_hex = expected_hash_from_sha256sums(sums_text, archive_asset.name())?;
+	if checksum_hex != signed_artifact.sha256 {
+		return Err(QuantusError::Generic(format!(
+			"Release checksum disagrees with the authenticated signed manifest for `{}`. Refusing to install.",
+			archive_asset.name()
+		)));
+	}
 
 	let tmp_dir = tempfile::TempDir::new()
 		.map_err(|e| QuantusError::Generic(format!("Failed to create temp dir for update: {e}")))?;
@@ -312,11 +565,18 @@ fn install_verified_release(
 			.map_err(|e| QuantusError::Generic(format!("Failed to flush archive download: {e}")))?;
 	}
 
-	log_print!("Verifying SHA-256...");
+	log_print!("Verifying authenticated SHA-256...");
 	let archive_bytes = fs::read(&archive_path)
 		.map_err(|e| QuantusError::Generic(format!("Failed to read downloaded archive: {e}")))?;
-	verify_sha256(&archive_bytes, &expected_hex)?;
-	log_print!("   Checksum OK.");
+	if archive_bytes.len() as u64 != signed_artifact.size {
+		return Err(QuantusError::Generic(format!(
+			"Release archive size mismatch: signed manifest expected {} bytes, downloaded {} bytes. Refusing to install.",
+			signed_artifact.size,
+			archive_bytes.len()
+		)));
+	}
+	verify_sha256(&archive_bytes, &signed_artifact.sha256)?;
+	log_print!("   Signed manifest + checksum agreement OK.");
 
 	let bin_path = substitute_bin_path(
 		updater.bin_path_in_archive(),
@@ -361,6 +621,8 @@ fn substitute_bin_path(template: &str, version: &str, target: &str, bin: &str) -
 
 /// Upper bound for the sha256sums text asset (a handful of lines).
 const MAX_SUMS_ASSET_BYTES: u64 = 64 * 1024;
+const MAX_MANIFEST_ASSET_BYTES: u64 = 256 * 1024;
+const MAX_SIGNATURE_ASSET_BYTES: u64 = 32 * 1024;
 /// Upper bound for the release archive. Real archives are tens of MB; this
 /// exists so a rogue release asset cannot exhaust disk/memory before the
 /// checksum is ever consulted.
@@ -445,7 +707,11 @@ fn map_self_update_err(err: self_update::errors::Error) -> QuantusError {
 
 #[cfg(test)]
 mod tests {
-	use super::{expected_hash_from_sha256sums, verify_sha256, version_is_newer, LimitedWriter};
+	use super::{
+		expected_hash_from_sha256sums, minisign_public_key_line_from_text,
+		validate_signed_release_manifest, verify_minisign_with_key, verify_sha256,
+		version_is_newer, LimitedWriter, UPDATE_REPOSITORY_TEXT,
+	};
 	use sha2::{Digest, Sha256};
 	use std::io::Write;
 
@@ -502,5 +768,66 @@ mod tests {
 		assert_eq!(expected_hash_from_sha256sums(&sums_multi, asset).unwrap(), hash);
 
 		assert!(expected_hash_from_sha256sums(&sums, "missing.tar.gz").is_err());
+	}
+
+	#[test]
+	fn minisign_test_vector_verifies_and_tampering_fails() {
+		// Prehashed Minisign fixture from minisign-verify 0.2.5.
+		// Production deliberately rejects legacy `Ed` signatures.
+		let public_key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+		let signature = "untrusted comment: signature from minisign secret key\n\
+RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\n\
+trusted comment: timestamp:1633700835\tfile:test\tprehashed\n\
+wLMDjy9FLAuxZ3q4NlEvkgtyhrr0gtTu6KC4KBJdITbbOeAi1zBIYo0v4iTgt8jJpIidRJnp94ABQkJAgAooBQ==";
+
+		assert!(
+			verify_minisign_with_key(public_key, b"test", signature).is_ok(),
+			"documented prehashed Minisign signature must verify with legacy mode disabled"
+		);
+		assert!(
+			verify_minisign_with_key(public_key, b"tampered", signature).is_err(),
+			"tampered content must fail signature verification"
+		);
+	}
+
+	#[test]
+	fn public_key_placeholder_is_rejected() {
+		assert!(
+			minisign_public_key_line_from_text(
+				"untrusted comment: test key\nUNCONFIGURED\n"
+			)
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn signed_manifest_binds_repository_version_commit_and_archive() {
+		let archive = "quantus-cli-v9.9.9-x86_64-pc-windows-msvc.zip";
+		let manifest = serde_json::json!({
+			"schema": 1,
+			"repository": UPDATE_REPOSITORY_TEXT.trim(),
+			"version": "v9.9.9",
+			"commit": "a".repeat(40),
+			"artifacts": [{
+				"name": archive,
+				"sha256": "b".repeat(64),
+				"size": 12345
+			}]
+		});
+		let bytes = serde_json::to_vec(&manifest).unwrap();
+		let artifact = validate_signed_release_manifest(&bytes, "9.9.9", archive).unwrap();
+		assert_eq!(artifact.name, archive);
+		assert_eq!(artifact.size, 12345);
+
+		let mut wrong_repo = manifest.clone();
+		wrong_repo["repository"] = serde_json::Value::String("attacker/example".to_string());
+		assert!(
+			validate_signed_release_manifest(
+				&serde_json::to_vec(&wrong_repo).unwrap(),
+				"9.9.9",
+				archive
+			)
+			.is_err()
+		);
 	}
 }
