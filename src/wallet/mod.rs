@@ -8,6 +8,8 @@
 pub mod checkphrase;
 pub mod keystore;
 pub mod password;
+#[cfg(windows)]
+pub(crate) mod windows_security;
 
 use crate::error::{QuantusError, Result, WalletError};
 pub use keystore::{DilithiumScheme, Keystore, QuantumKeyPair, WalletData};
@@ -148,6 +150,11 @@ impl WalletManager {
 		std::fs::create_dir_all(&wallets_dir)?;
 		#[cfg(unix)]
 		ensure_dir_owner_only(&wallets_dir)?;
+		#[cfg(windows)]
+		{
+			windows_security::harden_directory(&wallets_dir)?;
+			windows_security::harden_wallet_directory_contents(&wallets_dir)?;
+		}
 
 		Ok(Self { wallets_dir })
 	}

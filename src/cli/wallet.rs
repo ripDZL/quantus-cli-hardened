@@ -378,6 +378,11 @@ fn write_mnemonic_to_protected_file(
 	let mut file = options.open(path).map_err(|e| {
 		QuantusError::Generic(format!("Failed to create mnemonic export file: {e}"))
 	})?;
+	#[cfg(windows)]
+	crate::wallet::windows_security::harden_file(path).map_err(|e| {
+		let _ = std::fs::remove_file(path);
+		QuantusError::Generic(format!("Failed to protect mnemonic export file: {e}"))
+	})?;
 	file.write_all(mnemonic.as_bytes())
 		.map_err(|e| QuantusError::Generic(format!("Failed to write mnemonic export file: {e}")))?;
 	file.write_all(b"\n")

@@ -56,7 +56,12 @@ fn shell_quote(path: &str) -> String {
 	format!("'{}'", path.replace('\'', r"'\''"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn validate_owner_only_file(file: &std::fs::File, file_path: &str, kind: &str) -> Result<()> {
+	crate::wallet::windows_security::validate_secret_file(file, file_path, kind)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn validate_owner_only_file(_file: &std::fs::File, _file_path: &str, _kind: &str) -> Result<()> {
 	Ok(())
 }
@@ -78,8 +83,8 @@ fn open_secret_file(file_path: &str) -> std::io::Result<std::fs::File> {
 	std::fs::File::open(file_path)
 }
 
-/// Read a trimmed secret from a file, requiring (on Unix) a regular file owned
-/// by the current user with no group/other access bits.
+/// Read a trimmed secret from a file, requiring a regular file with owner-only
+/// security: Unix mode/ownership checks or strict Windows ACL validation.
 pub(crate) fn read_secret_file(file_path: &str, kind: &str) -> Result<String> {
 	use std::io::Read;
 
@@ -343,6 +348,9 @@ mod tests {
 			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
 				.expect("set secret file mode");
 		}
+		#[cfg(windows)]
+		crate::wallet::windows_security::harden_file(&path)
+			.expect("harden Windows secret test file");
 		let path_str = path.to_string_lossy().into_owned();
 		(dir, path_str)
 	}
@@ -467,6 +475,9 @@ mod secret_file_size_tests {
 			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
 				.expect("set owner-only permissions");
 		}
+		#[cfg(windows)]
+		crate::wallet::windows_security::harden_file(&path)
+			.expect("harden oversized Windows secret test file");
 
 		let path_text = path.to_string_lossy().into_owned();
 		let err = read_secret_file(&path_text, "password")

@@ -185,6 +185,8 @@ fn create_unique_temp(storage_path: &Path, name: &str) -> std::io::Result<(PathB
 fn write_temp_wallet_bytes(storage_path: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
 	let (tmp_path, mut file) = create_unique_temp(storage_path, name)?;
 	let result = (|| -> Result<()> {
+		#[cfg(windows)]
+		crate::wallet::windows_security::harden_file(&tmp_path)?;
 		file.write_all(data)?;
 		file.sync_all()?;
 		Ok(())
