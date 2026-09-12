@@ -5854,7 +5854,9 @@ mod tests {
 	#[serial_test::serial]
 	async fn load_multiround_wallet_errors_when_wallet_has_no_mnemonic() {
 		let home = tempfile::tempdir().unwrap();
-		std::env::set_var("HOME", home.path());
+		let _wallet_override = crate::wallet::TestWalletDirOverride::install(
+			&home.path().join(".quantus").join("wallets"),
+		);
 
 		let wallet_manager = WalletManager::new().unwrap();
 		wallet_manager.create_developer_wallet("crystal_alice").await.unwrap();

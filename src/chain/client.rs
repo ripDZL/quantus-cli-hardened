@@ -21,6 +21,44 @@ use subxt::{
 };
 use subxt_metadata::Metadata as SubxtMetadata;
 
+const INSECURE_REMOTE_WS_ENV: &str = "QUANTUS_ALLOW_INSECURE_REMOTE_WS";
+
+fn insecure_remote_ws_explicitly_allowed() -> bool {
+	std::env::var(INSECURE_REMOTE_WS_ENV)
+		.map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+		.unwrap_or(false)
+}
+
+fn ws_url_targets_loopback(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return false;
+    };
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some(end) = bracketed.find(']') else {
+            return false;
+        };
+
+        return bracketed[..end]
+            .parse::<std::net::Ipv6Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    }
+
+    let host = host_port.split(':').next().unwrap_or_default();
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.parse::<std::net::Ipv4Addr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SubxtBlake2bHasher;
 
@@ -107,6 +145,15 @@ impl QuantusClient {
             )));
 		}
 
+		if node_url.starts_with("ws://")
+			&& !ws_url_targets_loopback(node_url)
+			&& !insecure_remote_ws_explicitly_allowed()
+		{
+			return Err(QuantusError::NetworkError(format!(
+				"Refusing insecure remote WebSocket URL: '{display_node_url}'. Use wss:// for remote nodes. Set {INSECURE_REMOTE_WS_ENV}=1 only for isolated development networks where plaintext RPC is intentional."
+			)));
+		}
+
 		// Create WS client with custom timeouts
 		let ws_client = WsClientBuilder::default()
             // TODO: Make these configurable in a separate change
@@ -151,8 +198,9 @@ impl QuantusClient {
 		// Quantus specs are allowed with a warning (see validate_runtime_identity).
 		if enforce_runtime_identity {
 			crate::config::validate_runtime_version_value(&version_json).map_err(|e| match e {
-				QuantusError::NetworkError(msg) =>
-					QuantusError::NetworkError(format!("{msg} (from {display_node_url})")),
+				QuantusError::NetworkError(msg) => {
+					QuantusError::NetworkError(format!("{msg} (from {display_node_url})"))
+				},
 				other => other,
 			})?;
 		}
@@ -419,14 +467,16 @@ impl subxt::tx::Signer<ChainConfig> for QuantusSigner {
 	fn account_id(&self) -> <ChainConfig as Config>::AccountId {
 		use sp_core::Pair;
 		match &self.pair {
-			SignerPair::MlDsa65(pair) =>
+			SignerPair::MlDsa65(pair) => {
 				<qp_dilithium_crypto::types::Dilithium65Public as IdentifyAccount>::into_account(
 					pair.public(),
-				),
-			SignerPair::MlDsa87(pair) =>
+				)
+			},
+			SignerPair::MlDsa87(pair) => {
 				<qp_dilithium_crypto::types::Dilithium87Public as IdentifyAccount>::into_account(
 					pair.public(),
-				),
+				)
+			},
 		}
 	}
 
@@ -612,5 +662,23 @@ mod tests {
 		assert_eq!(QuantusClient::interpret_account_nonce(None), (0, false));
 		assert_eq!(QuantusClient::interpret_account_nonce(Some(0)), (0, true));
 		assert_eq!(QuantusClient::interpret_account_nonce(Some(7)), (7, true));
+	}
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+	use super::ws_url_targets_loopback;
+
+	#[test]
+	fn plaintext_ws_loopback_detection_is_strict() {
+		assert!(ws_url_targets_loopback("ws://127.0.0.1:9944"));
+		assert!(ws_url_targets_loopback("ws://127.42.0.7:9944/path"));
+		assert!(ws_url_targets_loopback("ws://localhost:9944"));
+		assert!(ws_url_targets_loopback("ws://[::1]:9944"));
+        assert!(!ws_url_targets_loopback("ws://127.attacker.example:9944"));
+        assert!(!ws_url_targets_loopback("ws://127.example.com:9944"));
+		assert!(!ws_url_targets_loopback("ws://192.168.1.10:9944"));
+		assert!(!ws_url_targets_loopback("ws://example.com:9944"));
+		assert!(!ws_url_targets_loopback("wss://example.com:443"));
 	}
 }

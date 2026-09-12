@@ -150,8 +150,8 @@ fn stale_artifact_provenance(dir: &Path) -> Option<String> {
 			if manifest.package_version != env!("CARGO_PKG_VERSION") {
 				return Some(format!("built by quantus-cli {}", manifest.package_version));
 			}
-			if manifest.num_leaf_proofs != env_num_leaf_proofs() ||
-				manifest.num_private_batch_proofs != env_num_private_batch_proofs()
+			if manifest.num_leaf_proofs != env_num_leaf_proofs()
+				|| manifest.num_private_batch_proofs != env_num_private_batch_proofs()
 			{
 				return Some(format!(
 					"sized for num_leaf_proofs={}, num_private_batch_proofs={}",
@@ -299,8 +299,8 @@ fn validate_manifest(dir: &Path, manifest: &ArtifactManifest) -> Result<()> {
 			"Circuit artifact manifest package version mismatch".to_string(),
 		));
 	}
-	if manifest.num_leaf_proofs != env_num_leaf_proofs() ||
-		manifest.num_private_batch_proofs != env_num_private_batch_proofs()
+	if manifest.num_leaf_proofs != env_num_leaf_proofs()
+		|| manifest.num_private_batch_proofs != env_num_private_batch_proofs()
 	{
 		return Err(QuantusError::Generic(
 			"Circuit artifact manifest sizing does not match current settings".to_string(),
@@ -601,6 +601,7 @@ mod tests {
 	}
 
 	// Shared publish helpers from build.rs (#160700).
+	#[cfg(unix)]
 	use super::fs_helpers::publish_dir_atomically;
 
 	#[cfg(unix)]

@@ -1,6 +1,8 @@
 use crate::{error::Result, log_print, log_verbose, wallet::WalletManager};
 use colored::Colorize;
 
+const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
+
 /// Ensure an already-opened secret file is a regular file owned by the current
 /// user with no group/other access bits set. Checking the handle (fstat) rather
 /// than the path avoids validating a different file than the one read.
@@ -88,6 +90,19 @@ pub(crate) fn read_secret_file(file_path: &str, kind: &str) -> Result<String> {
 		))
 	})?;
 	validate_owner_only_file(&file, file_path, kind)?;
+	let file_len = file
+		.metadata()
+		.map_err(|e| {
+			crate::error::QuantusError::Generic(format!(
+				"Failed to inspect {kind} file '{file_path}': {e}"
+			))
+		})?
+		.len();
+	if file_len > MAX_SECRET_FILE_BYTES {
+		return Err(crate::error::QuantusError::Generic(format!(
+			"Refusing to read {kind} file '{file_path}': file is {file_len} bytes, maximum is {MAX_SECRET_FILE_BYTES} bytes"
+		)));
+	}
 	let mut raw = String::new();
 	file.read_to_string(&mut raw).map_err(|e| {
 		crate::error::QuantusError::Generic(format!(
@@ -431,5 +446,31 @@ mod tests {
 				"expected restrictive-mode rejection with fix hint, got: {msg}"
 			);
 		}
+	}
+}
+
+#[cfg(test)]
+mod secret_file_size_tests {
+	use super::{read_secret_file, MAX_SECRET_FILE_BYTES};
+
+	#[test]
+	fn oversized_secret_file_is_rejected_before_read() {
+		let dir = tempfile::tempdir().expect("temp dir");
+		let path = dir.path().join("oversized-secret.txt");
+		let file = std::fs::File::create(&path).expect("create secret file");
+		file.set_len(MAX_SECRET_FILE_BYTES + 1).expect("size secret file");
+		drop(file);
+
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+				.expect("set owner-only permissions");
+		}
+
+		let path_text = path.to_string_lossy().into_owned();
+		let err = read_secret_file(&path_text, "password")
+			.expect_err("oversized secret file must be rejected");
+		assert!(err.to_string().contains("maximum"), "unexpected error: {err}");
 	}
 }

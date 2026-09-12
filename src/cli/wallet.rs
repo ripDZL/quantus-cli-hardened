@@ -503,7 +503,7 @@ pub async fn handle_wallet_command(
 			if all {
 				// Show all wallets (same as list command but with different header)
 				match wallet_manager.list_wallets() {
-					Ok(wallets) =>
+					Ok(wallets) => {
 						if wallets.is_empty() {
 							log_print!("{}", "No wallets found.".dimmed());
 						} else {
@@ -536,7 +536,8 @@ pub async fn handle_wallet_command(
 									log_print!();
 								}
 							}
-						},
+						}
+					},
 					Err(e) => {
 						log_error!("{}", format!("❌ Failed to view wallets: {e}").red());
 						return Err(e);
@@ -882,7 +883,7 @@ pub async fn handle_wallet_command(
 			let wallet_manager = WalletManager::new()?;
 
 			match wallet_manager.list_wallets() {
-				Ok(wallets) =>
+				Ok(wallets) => {
 					if wallets.is_empty() {
 						log_print!("{}", "No wallets found.".dimmed());
 						log_print!(
@@ -921,7 +922,8 @@ pub async fn handle_wallet_command(
 							"💡 Use 'quantus wallet view --name <wallet>' to see full details"
 								.dimmed()
 						);
-					},
+					}
+				},
 				Err(e) => {
 					log_error!("{}", format!("❌ Failed to list wallets: {e}").red());
 					return Err(e);
@@ -1022,9 +1024,10 @@ pub async fn handle_wallet_command(
 						.map_err(|e| QuantusError::Generic(format!("Invalid address: {e:?}")))?;
 					addr
 				},
-				(None, Some(wallet_name)) =>
+				(None, Some(wallet_name)) => {
 					crate::wallet::load_signer_from_wallet(&wallet_name, password, None)?
-						.try_account_id_ss58check()?,
+						.try_account_id_ss58check()?
+				},
 				(None, None) => {
 					// This case should be prevented by clap's `required_unless_present`
 					unreachable!("Either --address or --wallet must be provided");
@@ -1062,19 +1065,21 @@ mod tests {
 		command: crate::cli::Commands,
 	}
 
-	fn temp_home() -> TempDir {
-		let home = TempDir::new().expect("temp HOME");
-		std::env::set_var("HOME", home.path());
+	fn temp_home() -> (TempDir, crate::wallet::TestWalletDirOverride) {
+		let home = TempDir::new().expect("temp wallet root");
+		let wallet_override = crate::wallet::TestWalletDirOverride::install(
+			&home.path().join(".quantus").join("wallets"),
+		);
 		std::env::set_var("QUANTUS_NO_UPDATE_CHECK", "1");
 		std::env::remove_var("QUANTUS_WALLET_PASSWORD");
-		home
+		(home, wallet_override)
 	}
 
 	#[tokio::test]
 	#[serial]
 	async fn wallet_export_without_output_refuses_stdout_mnemonic() {
 		// #159469: export must not emit the recovery secret via log_print/stdout.
-		let _home = temp_home();
+		let (_home, _wallet_override) = temp_home();
 
 		let manager = WalletManager::new().expect("wallet manager");
 		manager.create_wallet("export-leak", Some("")).await.expect("create wallet");
@@ -1100,7 +1105,7 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn wallet_export_writes_mnemonic_to_protected_file_not_stdout_path() {
-		let home = temp_home();
+		let (home, _wallet_override) = temp_home();
 		std::env::remove_var("QUANTUS_WALLET_PASSWORD_EXPORT_FILE");
 
 		let manager = WalletManager::new().expect("wallet manager");
@@ -1173,7 +1178,7 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn wallet_import_from_mnemonic_file_matches_source_address() {
-		let home = temp_home();
+		let (home, _wallet_override) = temp_home();
 		std::env::remove_var("QUANTUS_WALLET_PASSWORD_SRC");
 		std::env::remove_var("QUANTUS_WALLET_PASSWORD_IMPORTED");
 

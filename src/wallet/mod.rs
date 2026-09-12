@@ -101,9 +101,39 @@ fn ensure_dir_owner_only(path: &std::path::Path) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(test)]
+pub(crate) struct TestWalletDirOverride {
+	previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestWalletDirOverride {
+	pub(crate) fn install(path: &std::path::Path) -> Self {
+		assert!(path.is_absolute(), "test wallet directory must be absolute");
+		let previous = std::env::var_os("QUANTUS_TEST_WALLETS_DIR");
+		std::env::set_var("QUANTUS_TEST_WALLETS_DIR", path);
+		Self { previous }
+	}
+}
+
+#[cfg(test)]
+impl Drop for TestWalletDirOverride {
+	fn drop(&mut self) {
+		match self.previous.take() {
+			Some(value) => std::env::set_var("QUANTUS_TEST_WALLETS_DIR", value),
+			None => std::env::remove_var("QUANTUS_TEST_WALLETS_DIR"),
+		}
+	}
+}
+
 impl WalletManager {
 	/// Create a new wallet manager
 	pub fn new() -> Result<Self> {
+		#[cfg(test)]
+		if let Some(wallets_dir) = std::env::var_os("QUANTUS_TEST_WALLETS_DIR") {
+			return Self::from_wallets_dir(std::path::PathBuf::from(wallets_dir));
+		}
+
 		let wallets_dir = dirs::home_dir()
 			.ok_or(WalletError::KeyGeneration)?
 			.join(".quantus")

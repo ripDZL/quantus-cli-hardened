@@ -225,7 +225,11 @@ pub async fn list_storage_items(
 	validate_pallet_exists(quantus_client.client(), pallet_name)?;
 
 	let metadata = quantus_client.client().metadata();
-	let pallet = metadata.pallet_by_name(pallet_name).unwrap();
+	let pallet = metadata.pallet_by_name(pallet_name).ok_or_else(|| {
+		QuantusError::Generic(format!(
+			"Pallet '{pallet_name}' disappeared from chain metadata during lookup"
+		))
+	})?;
 
 	if let Some(storage_metadata) = pallet.storage() {
 		let entries = storage_metadata.entries();
@@ -518,7 +522,11 @@ pub async fn iterate_storage_entries(
 
 	// Try to get storage metadata to show what type of storage this is
 	let metadata = quantus_client.client().metadata();
-	let pallet = metadata.pallet_by_name(pallet_name).unwrap();
+	let pallet = metadata.pallet_by_name(pallet_name).ok_or_else(|| {
+		QuantusError::Generic(format!(
+			"Pallet '{pallet_name}' disappeared from chain metadata during lookup"
+		))
+	})?;
 
 	if let Some(storage_metadata) = pallet.storage() {
 		if let Some(entry) = storage_metadata.entry_by_name(storage_name) {
@@ -820,14 +828,18 @@ pub async fn handle_storage_command(
 				.await
 			}
 		},
-		StorageCommands::List { pallet, names_only } =>
-			list_storage_items(&quantus_client, &pallet, names_only).await,
-		StorageCommands::ListPallets { with_counts } =>
-			list_pallets_with_storage(&quantus_client, with_counts).await,
-		StorageCommands::Stats { pallet, detailed } =>
-			show_storage_stats(&quantus_client, pallet, detailed).await,
-		StorageCommands::Iterate { pallet, name, limit, decode_as, block } =>
-			iterate_storage_entries(&quantus_client, &pallet, &name, limit, decode_as, block).await,
+		StorageCommands::List { pallet, names_only } => {
+			list_storage_items(&quantus_client, &pallet, names_only).await
+		},
+		StorageCommands::ListPallets { with_counts } => {
+			list_pallets_with_storage(&quantus_client, with_counts).await
+		},
+		StorageCommands::Stats { pallet, detailed } => {
+			show_storage_stats(&quantus_client, pallet, detailed).await
+		},
+		StorageCommands::Iterate { pallet, name, limit, decode_as, block } => {
+			iterate_storage_entries(&quantus_client, &pallet, &name, limit, decode_as, block).await
+		},
 	}
 }
 

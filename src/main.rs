@@ -8,22 +8,11 @@
 use clap::Parser;
 use colored::Colorize;
 
-mod batch_verifier;
-mod bins;
-mod chain;
-mod cli;
-mod collect_rewards_lib;
-mod config;
-mod error;
-mod log;
-mod qr;
-mod subsquid;
-mod version_check;
-mod wallet;
-mod wormhole_lib;
-
-use cli::Commands;
-use error::QuantusError;
+use quantus_cli::{
+	cli::{self, Commands},
+	error::QuantusError,
+	log, log_error, log_print, log_verbose, version_check,
+};
 
 #[derive(Parser)]
 #[command(name = "quantus")]

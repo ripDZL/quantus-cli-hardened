@@ -125,11 +125,11 @@ fn wallet_filename(name: &str) -> Result<String> {
 	// characters are reserved in Windows filenames; control characters are
 	// rejected everywhere.
 	const FORBIDDEN: &[char] = &['/', '\\', ':', '<', '>', '"', '|', '?', '*'];
-	if name.is_empty() ||
-		name == "." ||
-		name == ".." ||
-		name.contains(FORBIDDEN) ||
-		name.chars().any(|c| c.is_control())
+	if name.is_empty()
+		|| name == "."
+		|| name == ".."
+		|| name.contains(FORBIDDEN)
+		|| name.chars().any(|c| c.is_control())
 	{
 		return Err(WalletError::InvalidName.into());
 	}
@@ -630,8 +630,8 @@ impl Keystore {
 
 		let (account_id, format) = AccountId32::from_ss58check_with_version(address)
 			.map_err(|_| WalletError::InvalidAddress)?;
-		if format != quantus_ss58_format() ||
-			account_id.to_ss58check_with_version(quantus_ss58_format()) != address
+		if format != quantus_ss58_format()
+			|| account_id.to_ss58check_with_version(quantus_ss58_format()) != address
 		{
 			return Err(WalletError::InvalidAddress.into());
 		}
@@ -789,6 +789,15 @@ impl Keystore {
 		zeroize_bytes(&mut decrypted_data);
 		let wallet_data: WalletData = wallet_data_result?;
 
+		// The cleartext envelope name is duplicated inside the encrypted payload.
+		// Bind the two so renaming/tampering cannot silently change wallet identity.
+		if encrypted.name != wallet_data.name {
+			return Err(WalletError::Integrity(
+				"stored wallet name does not match encrypted wallet payload".to_string(),
+			)
+			.into());
+		}
+
 		// 4. The plaintext envelope address is not AEAD-authenticated, so it must
 		// match the address derived from the decrypted key material before the
 		// wallet file is accepted as intact.
@@ -826,9 +835,9 @@ impl Keystore {
 		let m_cost = parsed.params.get_decimal("m").unwrap_or(WALLET_ARGON2_M_COST);
 		let t_cost = parsed.params.get_decimal("t").unwrap_or(WALLET_ARGON2_T_COST);
 		let p_cost = parsed.params.get_decimal("p").unwrap_or(WALLET_ARGON2_P_COST);
-		if m_cost != WALLET_ARGON2_M_COST ||
-			t_cost != WALLET_ARGON2_T_COST ||
-			p_cost != WALLET_ARGON2_P_COST
+		if m_cost != WALLET_ARGON2_M_COST
+			|| t_cost != WALLET_ARGON2_T_COST
+			|| p_cost != WALLET_ARGON2_P_COST
 		{
 			return Err(WalletError::Decryption.into());
 		}

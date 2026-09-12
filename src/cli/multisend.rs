@@ -263,10 +263,14 @@ pub async fn handle_multisend_command(
 	// Prompt for confirmation unless --yes is passed
 	if !skip_confirmation {
 		print!("Proceed with this transaction? (yes/no): ");
-		io::stdout().flush().unwrap();
+		io::stdout().flush().map_err(|e| {
+			QuantusError::Generic(format!("Failed to flush transaction confirmation prompt: {e}"))
+		})?;
 
 		let mut input = String::new();
-		io::stdin().read_line(&mut input).unwrap();
+		io::stdin().read_line(&mut input).map_err(|e| {
+			QuantusError::Generic(format!("Failed to read transaction confirmation: {e}"))
+		})?;
 
 		if input.trim().to_lowercase() != "yes" {
 			log_print!("Multisend cancelled.");
