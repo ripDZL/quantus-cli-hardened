@@ -15,6 +15,83 @@ use quantus_cli::{
 };
 
 #[derive(Parser)]
+#[command(name = "quantus doctor")]
+struct DoctorCli {
+	/// Node endpoint URL
+	#[arg(long, default_value = "ws://127.0.0.1:9944")]
+	node_url: String,
+
+	/// Skip live node connectivity and runtime-identity checks
+	#[arg(long)]
+	offline: bool,
+
+	/// Enable verbose logging
+	#[arg(short, long)]
+	verbose: bool,
+}
+
+fn doctor_argv_from_process() -> Option<Vec<std::ffi::OsString>> {
+	let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+	if args.is_empty() {
+		return None;
+	}
+
+	let mut index = 1usize;
+	while index < args.len() {
+		let arg = args[index].to_string_lossy();
+
+		if arg == "doctor" {
+			let mut doctor_args = Vec::with_capacity(args.len() - 1);
+			doctor_args.push(args[0].clone());
+			doctor_args.extend(args[1..index].iter().cloned());
+			doctor_args.extend(args[index + 1..].iter().cloned());
+			return Some(doctor_args);
+		}
+
+		if matches!(arg.as_ref(), "-v" | "--verbose") || arg.starts_with("--node-url=") {
+			index += 1;
+			continue;
+		}
+
+		if arg == "--node-url" {
+			if index + 1 >= args.len() {
+				return None;
+			}
+			index += 2;
+			continue;
+		}
+
+		return None;
+	}
+
+	None
+}
+
+async fn try_run_doctor_fast_path() -> Option<Result<(), QuantusError>> {
+	let args = doctor_argv_from_process()?;
+	let doctor = DoctorCli::parse_from(args);
+
+	log::set_verbose(doctor.verbose);
+	log_print!("{}", "🔮 Quantus CLI".bright_cyan().bold());
+
+	let start_time = std::time::Instant::now();
+	let result = cli::doctor::handle_doctor_command(&doctor.node_url, doctor.offline).await;
+	let elapsed = start_time.elapsed();
+
+	match result {
+		Ok(()) => {
+			log_print!("⏱️  Completed in {:.2}s", elapsed.as_secs_f64());
+			Some(Ok(()))
+		},
+		Err(e) => {
+			log_error!("{}", e);
+			log_print!("⏱️  Failed after {:.2}s", elapsed.as_secs_f64());
+			Some(Err(e))
+		},
+	}
+}
+
+#[derive(Parser)]
 #[command(name = "quantus")]
 #[command(author = "Quantus Network")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
@@ -57,10 +134,30 @@ struct Cli {
 	camera_index: u32,
 }
 
+
+const CLI_PARSER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn parse_cli_with_dedicated_stack() -> Cli {
+	let handle = std::thread::Builder::new()
+		.name("quantus-cli-parser".to_string())
+		.stack_size(CLI_PARSER_STACK_BYTES)
+		.spawn(Cli::parse)
+		.expect("failed to start Quantus CLI parser thread");
+
+	match handle.join() {
+		Ok(cli) => cli,
+		Err(payload) => std::panic::resume_unwind(payload),
+	}
+}
+
 #[tokio::main]
 async fn main() -> Result<(), QuantusError> {
 	sp_core::crypto::set_default_ss58_version(sp_core::crypto::Ss58AddressFormat::custom(189));
-	let cli = Cli::parse();
+	if let Some(result) = try_run_doctor_fast_path().await {
+		return result;
+	}
+
+	let cli = parse_cli_with_dedicated_stack();
 
 	// Set up our custom logging
 	log::set_verbose(cli.verbose);

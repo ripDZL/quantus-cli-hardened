@@ -462,8 +462,172 @@ pub(crate) fn validate_secret_file(file: &File, file_path: &str, kind: &str) -> 
     })
 }
 
+fn security_sddl_for_path(path: &Path) -> io::Result<String> {
+    let wide = wide_path(path);
+    let mut owner: PSID = null_mut();
+    let mut dacl = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+
+    // SAFETY: wide is NUL-terminated; output pointers are valid for this call.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+
+    let descriptor_mem = LocalMem(descriptor.cast());
+    let text = descriptor_to_sddl(descriptor)?;
+    drop(descriptor_mem);
+    Ok(text)
+}
+
+fn validate_wallet_sddl(sddl: &str, current_sid: &str) -> std::result::Result<(), String> {
+    let owner = parse_owner_from_sddl(sddl)
+        .ok_or_else(|| "security descriptor has no owner".to_string())?;
+    if !owner.eq_ignore_ascii_case(current_sid) {
+        return Err(format!(
+            "owner {owner} does not match current user {current_sid}"
+        ));
+    }
+
+    let dacl_start = sddl
+        .find("D:")
+        .ok_or_else(|| "security descriptor has no DACL".to_string())?;
+    let dacl = &sddl[dacl_start + 2..];
+    let dacl = dacl.split("S:").next().unwrap_or(dacl);
+
+    if dacl.contains("NO_ACCESS_CONTROL") {
+        return Err("wallet path has a NULL DACL".to_string());
+    }
+
+    let ace_start = dacl.find('(').unwrap_or(dacl.len());
+    let flags = &dacl[..ace_start];
+    if !flags.to_ascii_uppercase().contains('P') {
+        return Err("wallet DACL is not protected from inheritance".to_string());
+    }
+
+    let mut saw_user = false;
+    let mut saw_system = false;
+    let mut remainder = &dacl[ace_start..];
+
+    while let Some(open) = remainder.find('(') {
+        let after_open = &remainder[open + 1..];
+        let close = after_open
+            .find(')')
+            .ok_or_else(|| "malformed ACL entry".to_string())?;
+        let ace = &after_open[..close];
+        let fields: Vec<&str> = ace.split(';').collect();
+        if fields.len() != 6 {
+            return Err(format!("complex ACL entry is not accepted: ({ace})"));
+        }
+
+        let ace_type = fields[0].to_ascii_uppercase();
+        let trustee = fields[5].trim();
+
+        if !matches!(ace_type.as_str(), "A" | "OA") {
+            return Err(format!(
+                "unexpected ACL entry type '{ace_type}' on wallet path"
+            ));
+        }
+
+        if trustee.eq_ignore_ascii_case(current_sid) {
+            saw_user = true;
+        } else if matches!(
+            trustee.to_ascii_uppercase().as_str(),
+            "SY" | "S-1-5-18"
+        ) {
+            saw_system = true;
+        } else {
+            return Err(format!(
+                "wallet ACL grants access to unexpected principal '{trustee}'"
+            ));
+        }
+
+        remainder = &after_open[close + 1..];
+    }
+
+    if !saw_user {
+        return Err("wallet ACL has no allow ACE for the current user".to_string());
+    }
+    if !saw_system {
+        return Err("wallet ACL has no allow ACE for LocalSystem".to_string());
+    }
+
+    Ok(())
+}
+
+/// Read-only validation used by `quantus doctor`.
+pub(crate) fn validate_wallet_path(path: &Path, directory: bool) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wallet path is a Windows reparse point",
+        ));
+    }
+
+    if directory && !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wallet path is not a directory",
+        ));
+    }
+    if !directory && !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wallet path is not a regular file",
+        ));
+    }
+
+    let current_sid = current_user_sid_string()?;
+    let sddl = security_sddl_for_path(path)?;
+    validate_wallet_sddl(&sddl, &current_sid)
+        .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn wallet_acl_parser_accepts_only_protected_user_and_system_acl() {
+        let current = "S-1-5-21-111-222-333-1001";
+        let sddl = format!(
+            "O:{current}D:P(A;;FA;;;{current})(A;;FA;;;SY)"
+        );
+        assert!(validate_wallet_sddl(&sddl, current).is_ok());
+    }
+
+    #[test]
+    fn wallet_acl_parser_rejects_builtin_admins_access() {
+        let current = "S-1-5-21-111-222-333-1001";
+        let sddl = format!(
+            "O:{current}D:P(A;;FA;;;{current})(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
+        assert!(validate_wallet_sddl(&sddl, current).is_err());
+    }
+
+    #[test]
+    fn wallet_acl_parser_rejects_inherited_dacl() {
+        let current = "S-1-5-21-111-222-333-1001";
+        let sddl = format!(
+            "O:{current}D:(A;;FA;;;{current})(A;;FA;;;SY)"
+        );
+        assert!(validate_wallet_sddl(&sddl, current).is_err());
+    }
     use super::*;
 
     #[test]
